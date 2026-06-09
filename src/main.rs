@@ -230,10 +230,40 @@ async fn init_project(
         chip_or_board.clone()
     };
 
+    // Ask about embassy-boot (DFU) for RP2040-based chips only.
+    let mut embassy_boot = false;
+    let mut flash_size: u32 = 2 * 1024 * 1024; // default 2 MB
+    if chip_or_board == "rp2040" || chip_or_board == "pico_w" {
+        embassy_boot = Select::new(
+            "Use embassy-boot (DFU firmware update via USB)?",
+            vec!["No", "Yes"],
+        )
+        .prompt()?
+            == "Yes";
+        if embassy_boot {
+            flash_size = Select::new(
+                "Total flash size:",
+                vec!["2 MB", "4 MB", "8 MB", "16 MB"],
+            )
+            .with_help_message(
+                "When in doubt, use 2 MB. Smaller works on bigger flashes.",
+            )
+            .prompt()
+            .map(|s| match s {
+                "2 MB" => 2 * 1024 * 1024,
+                "4 MB" => 4 * 1024 * 1024,
+                "8 MB" => 8 * 1024 * 1024,
+                "16 MB" => 16 * 1024 * 1024,
+                _ => unreachable!(),
+            })?;
+        }
+    }
+
+    let target_dir_clone = target_dir.clone();
     let project_info = ProjectInfo {
         project_name,
         target_dir,
-        remote_folder,
+        remote_folder: remote_folder.clone(),
         chip: chip_or_board,
         uf2_key,
         disabled_default_feature: Vec::new(),
@@ -243,8 +273,14 @@ async fn init_project(
     // Download template
     match local_path {
         Some(p) => {
-            // Copy local template to project_info.target_dir
-            copy_dir_recursive(Path::new(&p), &project_info.target_dir)?;
+            // Copy only the chip-specific subfolder to target directory
+            let src = Path::new(&p).join(&remote_folder);
+            if src.is_dir() {
+                copy_dir_recursive(&src, &project_info.target_dir)?;
+            } else {
+                // Fallback: copy the whole directory
+                copy_dir_recursive(Path::new(&p), &project_info.target_dir)?;
+            }
         }
         None => {
             // Use remote template
@@ -261,6 +297,103 @@ async fn init_project(
     // Post-process
     post_process(project_info)?;
 
+    // Apply embassy-boot customisations
+    if embassy_boot {
+        apply_embassy_boot(&target_dir_clone, flash_size)?;
+    }
+
+    Ok(())
+}
+
+/// Apply embassy-boot (DFU) template customisations to a generated project.
+fn apply_embassy_boot(
+    target_dir: &Path,
+    flash_size: u32,
+) -> Result<(), Box<dyn Error>> {
+    // ── memory.x ──────────────────────────────────────────────────────
+    // No BOOT2 region — the embassy-boot bootloader (e.g. bootymcbootface)
+    // provides it. The firmware starts at the ACTIVE slot (0x10007000).
+    // Matches rmk-config auto-calc: use all remaining flash after
+    // bootloader+state (28K), storage (default 128K=32×4K), and 1 page
+    // for DFU delta (embassy-boot invariant: dfu = active + 1 page).
+    let page_size = 4096u32;
+    let storage_size = 128 * 1024; // 32 sectors × 4K (rp2040 default)
+    let bootloader_state_end = 0x7000u32;
+    let remaining = flash_size - bootloader_state_end - storage_size;
+    let flash_len = (remaining - page_size) / 2;
+    let flash_len_str = if flash_len >= 1024 * 1024 {
+        format!("{}M", flash_len / (1024 * 1024))
+    } else if flash_len % 1024 == 0 {
+        format!("{}K", flash_len / 1024)
+    } else {
+        flash_len.to_string()
+    };
+    let memory_x = format!(
+        "MEMORY {{\n\
+         \x20   FLASH : ORIGIN = 0x10007000, LENGTH = {}\n\
+         \x20   RAM   : ORIGIN = 0x20000000, LENGTH = 256K\n\
+         }}\n",
+        flash_len_str
+    );
+    fs::write(target_dir.join("memory.x"), memory_x)?;
+
+    // ── Cargo.toml ────────────────────────────────────────────────────
+    let cargo_path = target_dir.join("Cargo.toml");
+
+    // 1  cortex-m-rt: add set-vtor (needed by embassy-boot for vector table relocation)
+    let cargo = fs::read_to_string(&cargo_path)?;
+    let cargo = cargo.replace(
+        "cortex-m-rt = \"0.7.5\"",
+        "cortex-m-rt = { version = \"0.7.5\", features = [\"set-vtor\"] }",
+    );
+    fs::write(&cargo_path, &cargo)?;
+
+    // 2  rmk feature: swap "rp2040" → "dfu_rp"
+    let mut manifest = cargo_toml::Manifest::from_path(&cargo_path)
+        .map_err(|e| format!("Failed to parse Cargo.toml: {}", e))?;
+    if let Some(cargo_toml::Dependency::Detailed(ref mut details)) = manifest.dependencies.get_mut("rmk") {
+        if let Some(pos) = details.features.iter().position(|f| f == "rp2040") {
+            details.features[pos] = "dfu_rp".to_string();
+        }
+        details.features.sort_unstable();
+        details.features.dedup();
+    }
+    let updated_toml = toml::to_string(&manifest)
+        .map_err(|e| format!("Failed to serialize Cargo.toml: {}", e))?;
+    fs::write(&cargo_path, &updated_toml)?;
+
+    // ── keyboard.toml ─────────────────────────────────────────────────
+    let kb_path = target_dir.join("keyboard.toml");
+    let mut kb = fs::read_to_string(&kb_path)?;
+    // ensure [storage] is present (needed by dfu_rp flash init)
+    if !kb.contains("[storage]") {
+        kb.push_str("\n[storage]\nenabled = true\n");
+    }
+    // Use led = "none" as default — PIN_25 conflicts with CYW43 on Pico W
+    if !kb.contains("[dfu]") {
+        kb.push_str(
+            "\n\
+             [dfu]\n\
+             led = \"none\"\n",
+        );
+    }
+    fs::write(&kb_path, kb)?;
+
+    // ── build.rs – strip flip-link & link-rp.x ────────────────────────
+    let build_path = target_dir.join("build.rs");
+    if build_path.exists() {
+        let build = fs::read_to_string(&build_path)?;
+        // comment out any flip-link references
+        let build = build.replace("flip-link", "# flip-link");
+        // strip -Tlink-rp.x — BOOT2 region is handled by the bootloader
+        let build = build.replace(
+            "println!(\"cargo:rustc-link-arg-bins=-Tlink-rp.x\");\n",
+            "",
+        );
+        fs::write(&build_path, build)?;
+    }
+
+    println!("✓ embassy-boot (DFU) template applied");
     Ok(())
 }
 
